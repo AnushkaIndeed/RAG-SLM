@@ -19,6 +19,8 @@ my_index/
 *.pickle
 *.index
 
+data/
+
 # IDE
 .vscode/
 .idea/

@@ -2,65 +2,125 @@
 FINAL INTEGRATED PIPELINE: real vector DB retrieval + planner +
 SLM agent pool, all connected.
 
-Includes TWO guards, in order:
-  1. Compound-query splitting: a query with multiple distinct parts
-     (e.g. "What did X find, and what is Y?") gets split BEFORE
-     retrieval, and each part is retrieved separately -- this fixes
-     the observed failure where a single embedding for a two-part
-     question let one sub-topic dominate and starved out the other
-     entirely (Amsterdam content retrieved, MAST silently dropped).
-  2. Retrieval-confidence guard: if the top score for ANY part is
-     below MIN_RELIABLE_SCORE, that part is flagged as unanswered
-     rather than silently omitted or answered from irrelevant context.
+UPGRADED (this version):
+  1. QUERY ANALYSIS is now a real model call, not a regex. The model
+     itself decides whether a query is ONE topic (however long or
+     detailed) or MULTIPLE distinct topics needing separate research
+     -- this is "the planner knows which part to break into multiple
+     parts and which to just answer as it is."
+  2. Each part still gets its own retrieval + confidence guard + task
+     planning/execution, exactly as before -- this is what keeps
+     different sources from getting blended/misattributed.
+  3. NEW: a SYNTHESIS step merges every part's answer into ONE
+     coherent final answer via a real model call, instead of just
+     concatenating "### Regarding: X" sections. The synthesis prompt
+     is explicitly told not to add any new facts -- only reorganize
+     and connect what's already been established, to avoid
+     introducing ungrounded content at the merge step.
 """
 
-import re
+import json
 
 from embeddings import SentenceTransformerEmbedder
 from vector_store import VectorStore
-from planner import run_planned_pipeline
+from planner import run_planned_pipeline, PLANNER_MODEL
+from slm_agents import call_ollama
 
 MIN_RELIABLE_SCORE = 0.30
+SYNTHESIS_MODEL = "qwen3:4b"   
 
 embedder = SentenceTransformerEmbedder()
 VECTOR_STORE = VectorStore(embedder)
 VECTOR_STORE.load("./my_index")
 
 
-def split_compound_query(query: str) -> list:
-    """Naive but effective split on common compound-question
-    connectors. Not a real model call (mocked, deliberately simple) --
-    marked below for the real upgrade path.
-    >>> REPLACE WITH REAL MODEL CALL <<<
-    A real version would use a small model to properly split a
-    compound question into independent sub-questions, handling cases
-    this regex can't (e.g. no explicit "and", nested clauses).
-    """
-    parts = re.split(r",?\s+and\s+what\s+is\s+|,?\s+and\s+what\s+are\s+", query, flags=re.IGNORECASE)
-    if len(parts) > 1:
-        # Re-attach "what is"/"what are" phrasing lost by the split,
-        # so each part still reads as a complete question
-        parts = [parts[0]] + [f"What is {p}" if not p.lower().startswith("what") else p for p in parts[1:]]
-    return [p.strip() for p in parts if p.strip()]
+QUERY_ANALYSIS_PROMPT = """You analyze a user's question to decide how
+to research it.
+
+Decide: does this question contain MULTIPLE DISTINCT, INDEPENDENT
+topics that would each need SEPARATE research/sources to answer well?
+Or is it ONE cohesive question, even if it's long, detailed, or has
+several clauses about the SAME underlying topic?
+
+Rules:
+- Do NOT split just because a question is long or has multiple
+  clauses -- only split when the parts are genuinely about different
+  subjects/sources (e.g. two different papers, two unrelated topics).
+- If it's one topic, return exactly one part: the original question,
+  unchanged.
+- If it's multiple distinct topics, return each as its own complete,
+  standalone question (re-attach words like "what is" if the split
+  would otherwise leave a sentence fragment).
+
+Respond with ONLY a JSON object, no explanation, no markdown fences.
+Example (single topic): {"parts": ["What is the MAST failure taxonomy?"]}
+Example (multiple topics): {"parts": ["What did the Amsterdam paper find about orchestrator reasoning?", "What is the MAST failure taxonomy?"]}
+
+User question: """
+
+
+def analyze_query(query: str) -> tuple:
+    """Real model call replacing the old regex split. Returns
+    (parts, raw_output) so the raw decision is visible in the debug
+    trace -- same principle as the planner's own decomposition."""
+    raw_output = call_ollama(PLANNER_MODEL, QUERY_ANALYSIS_PROMPT + query)
+    try:
+        cleaned = raw_output.strip().strip("`").replace("json\n", "")
+        parsed = json.loads(cleaned)
+        parts = [p.strip() for p in parsed.get("parts", []) if p.strip()]
+        if parts:
+            return parts, raw_output
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    # Fallback: if the model's output couldn't be parsed, treat the
+    # whole query as a single part rather than crashing or guessing
+    # at a split.
+    return [query], raw_output + "\n[PARSE FAILED - treated as single topic]"
 
 
 def retrieve_for_query(query: str, top_k: int = 3) -> dict:
-    """Retrieves for ONE query part, applying the confidence guard
-    to that part specifically."""
     chunks = VECTOR_STORE.search(query, top_k=top_k)
     top_score = chunks[0]["score"] if chunks else 0.0
     reliable = top_score >= MIN_RELIABLE_SCORE
     return {"query": query, "chunks": chunks, "top_score": top_score, "reliable": reliable}
 
 
+def synthesize_final_answer(original_query: str, per_part_answers: list) -> str:
+    """Merges every part's answer into ONE coherent final answer.
+    If there's only one part, skip the model call entirely -- nothing
+    to merge, and it avoids an unnecessary extra call."""
+    if len(per_part_answers) == 1:
+        return per_part_answers[0][1]
+
+    parts_text = "\n\n".join(f"[About: {q}]\n{a}" for q, a in per_part_answers)
+    prompt = (
+        f"The user asked: \"{original_query}\"\n\n"
+        f"Below are separately-researched answers to the different "
+        f"parts of this question. Merge them into ONE single, "
+        f"coherent, well-organized answer that reads naturally and "
+        f"addresses the full original question.\n\n"
+        f"IMPORTANT - stay strictly grounded: do NOT add any new "
+        f"facts, claims, or details that aren't already present in "
+        f"the text below. Only reorganize, connect, and smooth the "
+        f"transitions between the existing content. It is fine to use "
+        f"headings or clear paragraph breaks per topic if that reads "
+        f"better, but every fact must come from the material given.\n\n"
+        f"{parts_text}"
+    )
+    return call_ollama(SYNTHESIS_MODEL, prompt)
+
+
 def run_full_pipeline_v2(query: str, top_k: int = 3):
-    sub_queries = split_compound_query(query)
-    retrievals = [retrieve_for_query(q, top_k=top_k) for q in sub_queries]
-
     log = []
+    sub_queries, raw_analysis = analyze_query(query)
+    log.append(f"[QUERY_ANALYSIS] ({PLANNER_MODEL}) raw output: {raw_analysis}")
     if len(sub_queries) > 1:
-        log.append(f"Compound query detected -> split into {len(sub_queries)} parts: {sub_queries}")
+        log.append(f"[QUERY_ANALYSIS] Multiple distinct topics detected -> "
+                    f"split into {len(sub_queries)} parts: {sub_queries}")
+    else:
+        log.append(f"[QUERY_ANALYSIS] Single cohesive topic -> answered as one question")
 
+    retrievals = [retrieve_for_query(q, top_k=top_k) for q in sub_queries]
     reliable_retrievals = [r for r in retrievals if r["reliable"]]
     unreliable_parts = [r["query"] for r in retrievals if not r["reliable"]]
 
@@ -82,11 +142,6 @@ def run_full_pipeline_v2(query: str, top_k: int = 3):
         log.append(f"WARNING: no reliable context found for: {unreliable_parts} "
                     f"-- these part(s) of the question will be skipped, not guessed at.")
 
-    # KEY FIX: run planning + extraction SEPARATELY per sub-query, using
-    # only that sub-query's own retrieved context. This stops content
-    # from two different sources (e.g. two different papers) getting
-    # flattened together and misattributed to one another -- each
-    # sub-question gets its own clean, correctly-sourced answer.
     all_chunks = []
     per_part_answers = []
     for r in reliable_retrievals:
@@ -97,12 +152,10 @@ def run_full_pipeline_v2(query: str, top_k: int = 3):
         log.extend(part_result["task_log"])
         per_part_answers.append((r["query"], part_result["final_answer"]))
 
+    final_answer = synthesize_final_answer(query, per_part_answers)
     if len(per_part_answers) > 1:
-        final_answer = "\n\n".join(
-            f"### Regarding: {q}\n{a}" for q, a in per_part_answers
-        )
-    else:
-        final_answer = per_part_answers[0][1]
+        log.append(f"[SYNTHESIS] ({SYNTHESIS_MODEL}) merged {len(per_part_answers)} "
+                    f"part-answers into one coherent final answer")
 
     return {
         "query": query,

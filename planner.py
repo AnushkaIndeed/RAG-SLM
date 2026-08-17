@@ -1,22 +1,5 @@
 """
-PLANNER / ORCHESTRATION LAYER — updated per meeting notes:
-
-  1. Planning is now done by a REAL model call (qwen3:1.7b) instead of
-     keyword matching -- this is the "see how SLM breaks the tasks"
-     step. The model's raw output is logged so you can literally watch
-     how a real small model decomposes a query, and compare that
-     against the atomic-task rule to see if it agrees on its own or
-     needs the hard rule to override it.
-
-  2. Routing now walks TASK_REGISTRY instead of scanning AGENT_POOL by
-     capability -- agents are looked up by name, in the registry's
-     declared priority order, with automatic fallback to the next
-     agent in that list (usually GeneralistSLM-8B) if the first fails
-     or the task type isn't registered.
-
-  3. Rule 2 (atomicity) is now checked against task_registry.is_atomic()
-     as the single source of truth, instead of a hardcoded set living
-     in this file.
+PLANNER / ORCHESTRATION LAYER 
 """
 
 import json
@@ -26,9 +9,7 @@ from slm_agents import AGENTS_BY_NAME, call_ollama
 from task_registry import get_registration, is_atomic, get_agent_priority_list
 
 PLANNER_MODEL = "qwen3:8b"
-# Per meeting notes: "Planner agent 7b or 8b or 4b" -- to benchmark a
-# different planner size, just change this one line. Nothing else in
-# this file depends on the specific size.
+
 
 PLANNER_SYSTEM_PROMPT = """You are a task planner for a multi-agent system.
 Break the user's request into the MINIMUM set of task types needed.
@@ -64,7 +45,7 @@ Example: [{"type": "summarization", "complexity": "simple"},
 
 def decompose_query(query: str, context: str) -> tuple:
     """Real model call. Returns (task_list, raw_model_output) so the
-    raw output can be logged/inspected -- this is what lets you
+    raw output can be logged/inspected : this is what lets you
     literally observe how the SLM breaks the task down."""
     prompt = f"{PLANNER_SYSTEM_PROMPT}\n\nUser request: {query}"
     raw_output = call_ollama(PLANNER_MODEL, prompt)
@@ -163,11 +144,6 @@ def run_planned_pipeline(query: str, context: str) -> dict:
 
     results = {}
     for task in filtered_tasks:
-        # Dependency handling for the resume/GD example: skill_matching
-        # needs skill_extraction's output. This is a simple, explicit
-        # special-case (not a general dependency graph) -- the two-step
-        # "task 1 then task 2" pattern from the meeting notes doesn't
-        # need more than this for now.
         if task["type"] == "skill_matching" and "skill_extraction" in results:
             task["payload"]["required_skills"] = results["skill_extraction"]
             debug_step(log, "DEPENDENCY",
