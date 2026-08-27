@@ -23,59 +23,16 @@ import json
 
 from embeddings import SentenceTransformerEmbedder
 from vector_store import VectorStore
-from planner import run_planned_pipeline, PLANNER_MODEL
+from planner import run_planned_pipeline
 from slm_agents import call_ollama
+from multi_hop import detect_query_type, run_multi_hop_pipeline, MULTI_HOP_MODEL
 
 MIN_RELIABLE_SCORE = 0.30
-SYNTHESIS_MODEL = "qwen3:4b"   
+SYNTHESIS_MODEL = "qwen3:4b"   # merging text is a narrow task, keep it small
 
 embedder = SentenceTransformerEmbedder()
 VECTOR_STORE = VectorStore(embedder)
 VECTOR_STORE.load("./my_index")
-
-
-QUERY_ANALYSIS_PROMPT = """You analyze a user's question to decide how
-to research it.
-
-Decide: does this question contain MULTIPLE DISTINCT, INDEPENDENT
-topics that would each need SEPARATE research/sources to answer well?
-Or is it ONE cohesive question, even if it's long, detailed, or has
-several clauses about the SAME underlying topic?
-
-Rules:
-- Do NOT split just because a question is long or has multiple
-  clauses -- only split when the parts are genuinely about different
-  subjects/sources (e.g. two different papers, two unrelated topics).
-- If it's one topic, return exactly one part: the original question,
-  unchanged.
-- If it's multiple distinct topics, return each as its own complete,
-  standalone question (re-attach words like "what is" if the split
-  would otherwise leave a sentence fragment).
-
-Respond with ONLY a JSON object, no explanation, no markdown fences.
-Example (single topic): {"parts": ["What is the MAST failure taxonomy?"]}
-Example (multiple topics): {"parts": ["What did the Amsterdam paper find about orchestrator reasoning?", "What is the MAST failure taxonomy?"]}
-
-User question: """
-
-
-def analyze_query(query: str) -> tuple:
-    """Real model call replacing the old regex split. Returns
-    (parts, raw_output) so the raw decision is visible in the debug
-    trace -- same principle as the planner's own decomposition."""
-    raw_output = call_ollama(PLANNER_MODEL, QUERY_ANALYSIS_PROMPT + query)
-    try:
-        cleaned = raw_output.strip().strip("`").replace("json\n", "")
-        parsed = json.loads(cleaned)
-        parts = [p.strip() for p in parsed.get("parts", []) if p.strip()]
-        if parts:
-            return parts, raw_output
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        pass
-    # Fallback: if the model's output couldn't be parsed, treat the
-    # whole query as a single part rather than crashing or guessing
-    # at a split.
-    return [query], raw_output + "\n[PARSE FAILED - treated as single topic]"
 
 
 def retrieve_for_query(query: str, top_k: int = 3) -> dict:
@@ -112,8 +69,21 @@ def synthesize_final_answer(original_query: str, per_part_answers: list) -> str:
 
 def run_full_pipeline_v2(query: str, top_k: int = 3):
     log = []
-    sub_queries, raw_analysis = analyze_query(query)
-    log.append(f"[QUERY_ANALYSIS] ({PLANNER_MODEL}) raw output: {raw_analysis}")
+
+    # SINGLE unified decision: simple / independent-topics / multi-hop.
+    # Replaces the old two-separate-model-calls approach (one call
+    # deciding multi-hop, a second separately deciding independent
+    # splitting) -- one judgment point, can't disagree with itself.
+    plan = detect_query_type(query)
+    log.append(f"[QUERY_ANALYSIS] ({MULTI_HOP_MODEL}) type={plan.get('type')} "
+                f"raw={plan.get('_raw', '')}")
+
+    if plan.get("type") == "multi_hop":
+        result = run_multi_hop_pipeline(query, plan, VECTOR_STORE, top_k=top_k)
+        result["task_log"] = log + result["task_log"]
+        return result
+
+    sub_queries = plan.get("parts") or [query]
     if len(sub_queries) > 1:
         log.append(f"[QUERY_ANALYSIS] Multiple distinct topics detected -> "
                     f"split into {len(sub_queries)} parts: {sub_queries}")

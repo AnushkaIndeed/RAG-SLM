@@ -1,5 +1,5 @@
 """
-SLM agent pool, updated per meeting notes:
+SLM agent pool:
   - Extraction + summarization + keypoints merged into ONE agent
     (TextProcessingSLM), offered in TWO model-family variants (Qwen and
     Gemma) so they can be A/B compared on the same task -- this
@@ -47,11 +47,11 @@ class TextProcessingSLM(BaseSLMAgent):
     summarization, AND keypoints in one class. Instantiated TWICE
     below with different underlying models (Qwen vs Gemma), so the
     planner can route the same task type to either variant and you
-    can directly compare their outputs on identical input -- this is
+    can directly compare their outputs on identical input, this is
     the cross-model-family test the earlier research review flagged
     as an open gap."""
     capabilities = ["extraction", "summarization", "keypoints",
-                     "skill_extraction", "skill_matching"]
+                     "skill_extraction", "skill_matching", "numeric_extraction"]
 
     def __init__(self, ollama_model: str, name: str, model_size: str):
         self.ollama_model = ollama_model
@@ -100,6 +100,20 @@ class TextProcessingSLM(BaseSLMAgent):
                 f"supports it (Yes/No) and quote the specific resume "
                 f"phrase that supports it, if any."
             )
+        elif task_type == "numeric_extraction":
+            # For multi-hop computation: needs ONE clean number back,
+            # not a paragraph, since it feeds directly into
+            # CalculatorTool's deterministic math. Strict prompt +
+            # the caller (multi_hop.py) does its own regex cleanup as
+            # a second line of defense.
+            what_to_find = payload.get("fact_description", "the relevant number")
+            prompt = (
+                f"Find {what_to_find} in the following text. "
+                f"Respond with ONLY the number, no words, no units, no "
+                f"commentary, no explanation. If the text does not "
+                f"contain this information, respond with exactly: "
+                f"NOT_FOUND\n\nText:\n{context}"
+            )
         else:
             return f"[{self.name}] Unsupported task type: {task_type}"
         return f"[{self.name}] {call_ollama(self.ollama_model, prompt)}"
@@ -127,13 +141,46 @@ class CalculatorTool(BaseSLMAgent):
     model_size = "n/a (deterministic tool)"
 
     def run(self, task_type: str, payload: dict) -> str:
-        expr = payload.get("expression")
+        # Path A (existing): numbers stated literally in the query itself
         cost = payload.get("cost")
         annual_savings = payload.get("annual_savings")
         if cost and annual_savings:
             years = round(cost / annual_savings, 1)
             return f"[Calculator] Payback period = {cost} / {annual_savings} = {years} years"
-        return f"[Calculator] Result: {eval(expr) if expr else 'N/A'}"
+
+        # Path B (NEW, for multi-hop): numbers EXTRACTED from different
+        # documents in earlier steps, combined with a deterministic
+        # operation. Math is never left to an SLM to guess -- same
+        # principle as Path A, just generalized to accept values that
+        # came from retrieval instead of only from the query text.
+        operation = payload.get("operation")
+        value_a = payload.get("value_a")
+        value_b = payload.get("value_b")
+        label_a = payload.get("label_a", "value_a")
+        label_b = payload.get("label_b", "value_b")
+        if operation and value_a is not None and value_b is not None:
+            try:
+                value_a, value_b = float(value_a), float(value_b)
+            except (TypeError, ValueError):
+                return (f"[Calculator] ERROR: could not parse extracted values as "
+                         f"numbers ({label_a}='{value_a}', {label_b}='{value_b}') "
+                         f"-- extraction may have failed to isolate a clean number.")
+            ops = {
+                "add": lambda a, b: a + b,
+                "subtract": lambda a, b: a - b,
+                "multiply": lambda a, b: a * b,
+                "divide": lambda a, b: a / b if b != 0 else None,
+            }
+            if operation not in ops:
+                return f"[Calculator] ERROR: unknown operation '{operation}'"
+            result = ops[operation](value_a, value_b)
+            if result is None:
+                return f"[Calculator] ERROR: division by zero ({label_b} = 0)"
+            return (f"[Calculator] {label_a} ({value_a}) {operation} {label_b} "
+                    f"({value_b}) = {round(result, 4)}")
+
+        expr = payload.get("expression")
+        return f"[Calculator] Result: {eval(expr) if expr else 'N/A - no valid inputs given'}"
 
 
 class GeneralistFallbackSLM(BaseSLMAgent):

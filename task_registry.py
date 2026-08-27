@@ -17,13 +17,10 @@ from typing import Optional
 @dataclass
 class TaskRegistration:
     task_type: str
-    is_atomic: bool                # per meeting notes: some tasks must
-                                    # NEVER be decomposed further
-                                    # (summarization, keypoints, math, code)
+    is_atomic: bool                
     agents_in_priority_order: list = field(default_factory=list)
-   
+    # e.g. ["TextProcessingSLM-qwen", "TextProcessingSLM-gemma", "GeneralistSLM-8B"]
     complex_agents_in_priority_order: list = field(default_factory=list)
-    
     notes: str = ""
 
 
@@ -49,6 +46,14 @@ TASK_REGISTRY = {
         complex_agents_in_priority_order=["GeneralistSLM-8B", "TextProcessingSLM-qwen"],
         notes="ATOMIC: never split into per-fact sub-tasks.",
     ),
+    "numeric_extraction": TaskRegistration(
+        task_type="numeric_extraction",
+        is_atomic=True,
+        agents_in_priority_order=["TextProcessingSLM-qwen", "GeneralistSLM-8B"],
+        notes="ATOMIC. Extracts ONE clean number from a document, used "
+              "as an input to multi-hop computation (see multi_hop.py). "
+              "Strict output format: just the number, or NOT_FOUND.",
+    ),
     "skill_extraction": TaskRegistration(
         task_type="skill_extraction",
         is_atomic=True,
@@ -63,12 +68,6 @@ TASK_REGISTRY = {
         task_type="skill_matching",
         is_atomic=True,
         agents_in_priority_order=["TextProcessingSLM-qwen", "GeneralistSLM-8B"],
-        # Deliberately NO complex_agents list: matching against a
-        # resume is a narrow, grounded comparison task even when the
-        # GD topic itself was vague -- per meeting notes, this is the
-        # "particular" half of the pipeline and should stay on the
-        # smaller model to keep answers tightly grounded, not biased
-        # by a bigger model's broader (and looser) associations.
         notes="ATOMIC. Compares extracted GD skills against resume skills. "
               "Depends on 'skill_extraction' output -- planner.py injects "
               "that result into this task's payload automatically. Must "

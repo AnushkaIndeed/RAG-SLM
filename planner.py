@@ -1,5 +1,6 @@
 """
 PLANNER / ORCHESTRATION LAYER 
+
 """
 
 import json
@@ -9,7 +10,6 @@ from slm_agents import AGENTS_BY_NAME, call_ollama
 from task_registry import get_registration, is_atomic, get_agent_priority_list
 
 PLANNER_MODEL = "qwen3:8b"
-
 
 PLANNER_SYSTEM_PROMPT = """You are a task planner for a multi-agent system.
 Break the user's request into the MINIMUM set of task types needed.
@@ -26,16 +26,34 @@ RULES you must follow:
 - Only include a task type if the request actually needs it.
 - If the request includes a calculation, extract the two relevant
   numbers into "cost" and "annual_savings" fields.
-- For EACH task, set "complexity" to either "simple" or "complex".
-  Mark a task "complex" when the request is VAGUE, OPEN-ENDED, or
-  requires broad/general knowledge not likely to be narrowly covered
-  by the provided context. Mark it "simple" when the request is
-  PARTICULAR/SPECIFIC and clearly answerable from the given context.
-  This decides which size of model handles the task, so get this right.
 - If the request is about matching skills from a job description /
   group discussion (GD) topic against a resume, use "skill_extraction"
   first (pull required skills from the GD/JD text) and then
   "skill_matching" (compare those against the resume).
+
+COMPLEXITY CLASSIFICATION — set "complexity" to "simple" or "complex"
+for EVERY task. This decides which size of model handles the task, so
+be consistent and use these worked examples as your anchor, not just
+the definition:
+
+  "complex" examples (broad, open-ended, needs general knowledge
+  beyond what's narrowly in the provided context):
+    - "Give me a broad take on multi-agent system design philosophy"
+    - "What's your overall view on whether SLMs are the future of AI?"
+    - "Explain the general tradeoffs of agentic architectures"
+
+  "simple" examples (narrow, specific, directly answerable from the
+  given context without needing broader judgment):
+    - "What GAIA score did the 8B orchestrator get?"
+    - "What are the three MAST failure categories?"
+    - "Calculate the payback period for $15000 at $1200/year savings"
+    - "List the skills mentioned in this resume"
+
+  The test to apply: could a reasonably informed person answer this
+  confidently using ONLY the exact text given as context, without
+  needing to bring in outside judgment or broader synthesis? If yes,
+  "simple". If the question asks for a synthesis, opinion, overview,
+  or broad framing that goes beyond restating specific facts, "complex".
 
 Respond with ONLY a JSON list, no explanation, no markdown fences.
 Example: [{"type": "summarization", "complexity": "simple"},
@@ -45,7 +63,7 @@ Example: [{"type": "summarization", "complexity": "simple"},
 
 def decompose_query(query: str, context: str) -> tuple:
     """Real model call. Returns (task_list, raw_model_output) so the
-    raw output can be logged/inspected : this is what lets you
+    raw output can be logged/inspected -- this is what lets you
     literally observe how the SLM breaks the task down."""
     prompt = f"{PLANNER_SYSTEM_PROMPT}\n\nUser request: {query}"
     raw_output = call_ollama(PLANNER_MODEL, prompt)
@@ -75,9 +93,9 @@ def decompose_query(query: str, context: str) -> tuple:
     except (json.JSONDecodeError, TypeError, AttributeError):
         pass
 
-    # If parsing fails, fall back to a single extraction task so the
-    # user still gets SOMETHING instead of a hard failure. This is
-    # deliberately a "best effort" fallback, not a guaranteed answer.   
+    # Fallback: if the planner model's output couldn't be parsed
+    # (small models sometimes ignore format instructions), fall back
+    # to a single extraction task rather than crashing the pipeline.
     fallback_tasks = [{"type": "extraction", "payload": {"context": context, "query": query}}]
     return fallback_tasks, raw_output + "\n[PARSE FAILED - fell back to single extraction task]"
 
@@ -144,6 +162,7 @@ def run_planned_pipeline(query: str, context: str) -> dict:
 
     results = {}
     for task in filtered_tasks:
+        
         if task["type"] == "skill_matching" and "skill_extraction" in results:
             task["payload"]["required_skills"] = results["skill_extraction"]
             debug_step(log, "DEPENDENCY",
@@ -151,11 +170,11 @@ def run_planned_pipeline(query: str, context: str) -> dict:
         results[task["type"]] = route_task(task, log)
 
     synthesis = "\n\n".join(f"-- {k.upper()} --\n{v}" for k, v in results.items())
-    debug_trace = [f"[{e['stage']}] {e['detail']}" for e in log]  
+    debug_trace = [f"[{e['stage']}] {e['detail']}" for e in log] 
     return {
         "query": query,
         "task_log": debug_trace,
-        "debug_trace_structured": log,  
+        "debug_trace_structured": log,   
         "results": results,
         "final_answer": synthesis,
     }
