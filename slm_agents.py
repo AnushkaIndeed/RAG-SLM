@@ -47,7 +47,7 @@ class TextProcessingSLM(BaseSLMAgent):
     summarization, AND keypoints in one class. Instantiated TWICE
     below with different underlying models (Qwen vs Gemma), so the
     planner can route the same task type to either variant and you
-    can directly compare their outputs on identical input, this is
+    can directly compare their outputs on identical input -- this is
     the cross-model-family test the earlier research review flagged
     as an open gap."""
     capabilities = ["extraction", "summarization", "keypoints",
@@ -140,19 +140,17 @@ class CalculatorTool(BaseSLMAgent):
     capabilities = ["math"]
     model_size = "n/a (deterministic tool)"
 
-    def run(self, task_type: str, payload: dict) -> str:
-        # Path A (existing): numbers stated literally in the query itself
+    def compute(self, payload: dict):
+        """Returns (display_string, numeric_result_or_None). Split out
+        from run() so multi_hop.py's computation chain can grab the
+        raw numeric result to feed into a LATER step, not just the
+        formatted display string."""
         cost = payload.get("cost")
         annual_savings = payload.get("annual_savings")
         if cost and annual_savings:
             years = round(cost / annual_savings, 1)
-            return f"[Calculator] Payback period = {cost} / {annual_savings} = {years} years"
+            return f"[Calculator] Payback period = {cost} / {annual_savings} = {years} years", years
 
-        # Path B (NEW, for multi-hop): numbers EXTRACTED from different
-        # documents in earlier steps, combined with a deterministic
-        # operation. Math is never left to an SLM to guess -- same
-        # principle as Path A, just generalized to accept values that
-        # came from retrieval instead of only from the query text.
         operation = payload.get("operation")
         value_a = payload.get("value_a")
         value_b = payload.get("value_b")
@@ -164,7 +162,22 @@ class CalculatorTool(BaseSLMAgent):
             except (TypeError, ValueError):
                 return (f"[Calculator] ERROR: could not parse extracted values as "
                          f"numbers ({label_a}='{value_a}', {label_b}='{value_b}') "
-                         f"-- extraction may have failed to isolate a clean number.")
+                         f"-- extraction may have failed to isolate a clean number.", None)
+
+            if operation == "compare":
+                # Deterministic comparison -- never left to an SLM to
+                # judge "which is bigger" or compute the percentage
+                # difference, same grounding principle as the other ops.
+                if value_a == value_b:
+                    return f"[Calculator] {label_a} ({value_a}) equals {label_b} ({value_b})", 0.0
+                bigger, smaller = (label_a, label_b) if value_a > value_b else (label_b, label_a)
+                big_val, small_val = max(value_a, value_b), min(value_a, value_b)
+                diff = big_val - small_val
+                pct = round((diff / small_val) * 100, 2) if small_val != 0 else None
+                pct_text = f" ({pct}% higher)" if pct is not None else ""
+                return (f"[Calculator] {bigger} ({big_val}) is greater than "
+                        f"{smaller} ({small_val}) by {round(diff, 4)}{pct_text}", diff)
+
             ops = {
                 "add": lambda a, b: a + b,
                 "subtract": lambda a, b: a - b,
@@ -172,15 +185,22 @@ class CalculatorTool(BaseSLMAgent):
                 "divide": lambda a, b: a / b if b != 0 else None,
             }
             if operation not in ops:
-                return f"[Calculator] ERROR: unknown operation '{operation}'"
+                return f"[Calculator] ERROR: unknown operation '{operation}'", None
             result = ops[operation](value_a, value_b)
             if result is None:
-                return f"[Calculator] ERROR: division by zero ({label_b} = 0)"
+                return f"[Calculator] ERROR: division by zero ({label_b} = 0)", None
+            result = round(result, 4)
             return (f"[Calculator] {label_a} ({value_a}) {operation} {label_b} "
-                    f"({value_b}) = {round(result, 4)}")
+                    f"({value_b}) = {result}", result)
 
         expr = payload.get("expression")
-        return f"[Calculator] Result: {eval(expr) if expr else 'N/A - no valid inputs given'}"
+        if expr:
+            return f"[Calculator] Result: {eval(expr)}", None
+        return "[Calculator] Result: N/A - no valid inputs given", None
+
+    def run(self, task_type: str, payload: dict) -> str:
+        display, _ = self.compute(payload)
+        return display
 
 
 class GeneralistFallbackSLM(BaseSLMAgent):

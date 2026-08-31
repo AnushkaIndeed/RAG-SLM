@@ -36,7 +36,6 @@ from slm_agents import call_ollama, TEXT_AGENT_QWEN, CALCULATOR_AGENT
 
 MIN_RELIABLE_SCORE = 0.30
 MULTI_HOP_MODEL = "qwen3:8b"   
-
 MULTI_HOP_DETECTION_PROMPT = """You analyze a user's question to decide
 its TYPE, for a system that has access to a document index.
 
@@ -60,17 +59,28 @@ split just because a question is long or has multiple clauses about
 the SAME topic -- only split genuinely different subjects/sources.
 
 For "multi_hop" ONLY, also output:
-  - "facts_needed": a list of objects, each with:
+  - "facts_needed": a list of RAW facts to extract from documents,
+    each with:
       "label": a short snake_case identifier for this fact
       "search_query": a natural question to retrieve/extract this
                         ONE fact (phrase it so it would match a
                         document specifically ABOUT this fact)
       "fact_description": a short description of what to extract
                            (used to prompt the extractor)
-  - "operation": one of "add", "subtract", "multiply", "divide"
-  - "numerator_label" / "denominator_label" (for divide), OR
-    "value_a_label" / "value_b_label" (for add/subtract/multiply)
-    -- must match one of the labels in facts_needed
+  - "computation_steps": an ORDERED list of calculation steps. Each
+    step has:
+      "label": a short snake_case identifier for THIS STEP'S result
+               (later steps, or the final answer, can reference this
+               label the same way they'd reference a raw fact)
+      "operation": one of "add", "subtract", "multiply", "divide", "compare"
+      "operand_a_label" / "operand_b_label": labels to combine -- each
+        MUST be either a label from facts_needed, OR the label of an
+        EARLIER step in this same computation_steps list (never a
+        later one).
+    Use MULTIPLE steps whenever the question needs more than one
+    calculation before it's answerable (e.g. compute two derived
+    values first, THEN compare them) -- do not try to force a
+    multi-step calculation into a single operation.
 
 WORKED EXAMPLES to anchor your judgment (use these as reference
 points, not just the definitions above):
@@ -85,21 +95,44 @@ points, not just the definitions above):
   about orchestrator reasoning?", "What is the MAST failure
   taxonomy?"]}
 
-  multi_hop: "Find the population of Bihar and using the total income
-  of Bihar, calculate the average income per person." ->
+  multi_hop (single step): "Find the population of Bihar and using
+  the total income of Bihar, calculate the average income per
+  person." ->
   {"type": "multi_hop",
    "facts_needed": [
      {"label": "population_bihar", "search_query": "What is the population of Bihar?", "fact_description": "the total population number of Bihar"},
      {"label": "income_bihar", "search_query": "What is the total income of Bihar?", "fact_description": "the total income figure for Bihar"}
    ],
-   "operation": "divide",
-   "numerator_label": "income_bihar",
-   "denominator_label": "population_bihar"}
+   "computation_steps": [
+     {"label": "avg_income_bihar", "operation": "divide", "operand_a_label": "income_bihar", "operand_b_label": "population_bihar"}
+   ]}
+
+  multi_hop (CHAINED, multiple steps -- e.g. a comparison between two
+  states, where each side must FIRST be derived before comparing):
+  "Compare the average income per person in Kerala versus Uttar
+  Pradesh" ->
+  {"type": "multi_hop",
+   "facts_needed": [
+     {"label": "population_kerala", "search_query": "What is the population of Kerala?", "fact_description": "the total population number of Kerala"},
+     {"label": "income_kerala", "search_query": "What is the total income of Kerala?", "fact_description": "the total income figure for Kerala"},
+     {"label": "population_up", "search_query": "What is the population of Uttar Pradesh?", "fact_description": "the total population number of Uttar Pradesh"},
+     {"label": "income_up", "search_query": "What is the total income of Uttar Pradesh?", "fact_description": "the total income figure for Uttar Pradesh"}
+   ],
+   "computation_steps": [
+     {"label": "avg_income_kerala", "operation": "divide", "operand_a_label": "income_kerala", "operand_b_label": "population_kerala"},
+     {"label": "avg_income_up", "operation": "divide", "operand_a_label": "income_up", "operand_b_label": "population_up"},
+     {"label": "comparison_result", "operation": "compare", "operand_a_label": "avg_income_kerala", "operand_b_label": "avg_income_up"}
+   ]}
 
   The key test for multi_hop specifically: could you even ATTEMPT to
   answer the second part without already knowing the numeric result
   of the first part? If yes -> multi_hop. If both parts are answerable
-  independently in any order -> independent.
+  independently in any order -> independent. And: never ask a
+  search_query for a value that would have to be CALCULATED (like
+  "average income per person") unless that exact phrase is likely to
+  appear verbatim in a document -- if it's derived, extract the RAW
+  components instead (population, total income) and add a
+  computation_step to derive it.
 
 Respond with ONLY a JSON object, no explanation, no markdown fences.
 
@@ -139,14 +172,17 @@ def _clean_number(raw_text: str):
 
 def run_multi_hop_pipeline(query: str, plan: dict, vector_store, top_k: int = 3) -> dict:
     """Executes a detected multi-hop plan: retrieve + extract each
-    needed fact (each from its own best-matching document), then
-    compute deterministically, then synthesize a grounded answer."""
+    needed fact (each from its own best-matching document), then runs
+    an ORDERED CHAIN of computation steps -- later steps can consume
+    earlier steps' results by label, which is what makes nested
+    calculations (derive A, derive B, then compare A vs B) possible,
+    not just a single flat operation."""
     log = [f"[MULTI_HOP_PLAN] {json.dumps(plan)}"]
-    extracted_values = {}
+    known_values = {}   # accumulates BOTH extracted facts AND computed step results
     all_chunks = []
     fact_summaries = []
 
-    for fact in plan["facts_needed"]:
+    for fact in plan.get("facts_needed", []):
         label = fact["label"]
         search_query = fact["search_query"]
 
@@ -184,34 +220,70 @@ def run_multi_hop_pipeline(query: str, plan: dict, vector_store, top_k: int = 3)
                     f"value from it.",
             }
 
-        extracted_values[label] = cleaned_value
+        known_values[label] = cleaned_value
         fact_summaries.append(f"{label} = {cleaned_value} (source: {chunks[0]['id']})")
 
-    # Deterministic computation -- never left to an SLM to guess
-    calc_payload = {"operation": plan["operation"]}
-    if plan["operation"] == "divide":
-        calc_payload["value_a"] = extracted_values[plan["numerator_label"]]
-        calc_payload["value_b"] = extracted_values[plan["denominator_label"]]
-        calc_payload["label_a"] = plan["numerator_label"]
-        calc_payload["label_b"] = plan["denominator_label"]
-    else:
-        calc_payload["value_a"] = extracted_values[plan["value_a_label"]]
-        calc_payload["value_b"] = extracted_values[plan["value_b_label"]]
-        calc_payload["label_a"] = plan["value_a_label"]
-        calc_payload["label_b"] = plan["value_b_label"]
+    # Backward-compat: accept the old flat single-operation format too
+    computation_steps = plan.get("computation_steps")
+    if not computation_steps and plan.get("operation"):
+        if plan["operation"] == "divide" and "numerator_label" in plan:
+            computation_steps = [{"label": "result", "operation": "divide",
+                                   "operand_a_label": plan["numerator_label"],
+                                   "operand_b_label": plan["denominator_label"]}]
+        elif "value_a_label" in plan:
+            computation_steps = [{"label": "result", "operation": plan["operation"],
+                                   "operand_a_label": plan["value_a_label"],
+                                   "operand_b_label": plan["value_b_label"]}]
 
-    calc_result = CALCULATOR_AGENT.run("math", calc_payload)
-    log.append(f"[MULTI_HOP_COMPUTE] {calc_result}")
+    if not computation_steps:
+        log.append("[MULTI_HOP_FAIL] plan had no computation_steps and no "
+                   "legacy operation fields -- nothing to compute")
+        return {
+            "query": query, "task_log": log, "retrieved_chunks": all_chunks,
+            "results": {}, "final_answer":
+                "[No confident answer generated] The plan didn't specify how "
+                "to combine the extracted facts.",
+        }
+
+    step_results = []
+    for step in computation_steps:
+        label_a, label_b = step["operand_a_label"], step["operand_b_label"]
+        if label_a not in known_values or label_b not in known_values:
+            missing = [l for l in (label_a, label_b) if l not in known_values]
+            log.append(f"[MULTI_HOP_STEP_FAIL] step '{step['label']}' references "
+                       f"unknown label(s) {missing} -- plan referenced a fact/step "
+                       f"that was never extracted or computed")
+            return {
+                "query": query, "task_log": log, "retrieved_chunks": all_chunks,
+                "results": {}, "final_answer":
+                    f"[No confident answer generated] The computation plan "
+                    f"referenced {missing}, which was never extracted.",
+            }
+
+        calc_payload = {
+            "operation": step["operation"],
+            "value_a": known_values[label_a], "value_b": known_values[label_b],
+            "label_a": label_a, "label_b": label_b,
+        }
+        display, numeric_result = CALCULATOR_AGENT.compute(calc_payload)
+        log.append(f"[MULTI_HOP_COMPUTE] step '{step['label']}': {display}")
+        step_results.append(display)
+
+        if numeric_result is None:
+            log.append(f"[MULTI_HOP_STEP_FAIL] step '{step['label']}' produced no "
+                       f"usable numeric result -- cannot continue the chain")
+            break
+        known_values[step["label"]] = numeric_result   # available to LATER steps
 
     final_answer = (
         f"Based on the extracted facts:\n" + "\n".join(f"- {s}" for s in fact_summaries) +
-        f"\n\n{calc_result}"
+        f"\n\nCalculation steps:\n" + "\n".join(f"- {s}" for s in step_results)
     )
 
     return {
         "query": query,
         "task_log": log,
         "retrieved_chunks": all_chunks,
-        "results": {"multi_hop_computation": calc_result},
+        "results": {"multi_hop_computation": " | ".join(step_results)},
         "final_answer": final_answer,
     }
